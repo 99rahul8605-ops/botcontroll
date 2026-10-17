@@ -94,3 +94,31 @@ On a small Render instance, 8-15 is a sensible range. Higher is not always faste
 - Background-job launcher is lazy, avoiding orphan coroutine objects on duplicate clicks.
 - Mongo counts used by UI run in worker threads.
 - Default broadcast concurrency reduced to 8 for smoother Telegram rate-limit behaviour.
+
+
+## v7 — actual broadcast freeze fix
+
+The earlier builds still had the old blocking code path. This build was verified against the generated `main.py`.
+
+### What changed
+
+- `📣 Broadcast` only schedules a background task and returns immediately.
+- The callback handler no longer contains `await broadcast_bot(...)`.
+- `📥 Re-import` is also background work.
+- Managed bot startup does not wait for Mongo import.
+- Mongo import runs in `asyncio.to_thread(...)`.
+- Broadcast uses bounded parallel sends (`BROADCAST_CONCURRENCY=5` by default).
+- Telegram/network retries are bounded to 3 attempts; no infinite retry loop.
+- Progress updates after small chunks (normally 20–25 users).
+- `/status` shows all current background jobs.
+- `📊 Live Status` shows sent / blocked / failed / total.
+
+### Render logs you should see after pressing Broadcast
+
+- `MASTER callback ... data=bc:<BOT_ID>`
+- `JOB scheduled key=broadcast:<BOT_ID>`
+- `BROADCAST start ...`
+- repeated `BROADCAST progress ...`
+- `BROADCAST complete ...`
+
+If the job crashes, logs show `JOB failed key=...` with the traceback.

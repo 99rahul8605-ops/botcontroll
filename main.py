@@ -53,6 +53,11 @@ db = None
 running = {}
 configs = {}
 
+jobs = {}
+job_status = {}
+BROADCAST_CONCURRENCY = max(1, int(os.getenv("BROADCAST_CONCURRENCY", "5")))
+IMPORT_BATCH_SIZE = max(100, int(os.getenv("IMPORT_BATCH_SIZE", "1000")))
+
 
 def is_admin(update: Update) -> bool:
     return bool(update.effective_user and update.effective_user.id == ADMIN_USER_ID)
@@ -389,10 +394,6 @@ async def choose_uid_field(update, context):
 
     try:
         await start_managed(cfg)
-        saved = db.users.count_documents({"bot_id": cfg["bot_id"]})
-        stats = db.bot_configs.find_one({"bot_id": cfg["bot_id"]}) or {}
-        scanned = stats.get("last_import_scanned", 0)
-        found = stats.get("last_import_found", 0)
 
         text = (
             f"✅ Bot added successfully\n\n"
@@ -401,9 +402,8 @@ async def choose_uid_field(update, context):
             f"DB: {cfg['source_db']}\n"
             f"Collection: {cfg['source_collection']}\n"
             f"UID field: {uid_field}\n\n"
-            f"📊 Scanned: {scanned}\n"
-            f"📥 IDs found: {found}\n"
-            f"💾 Unique users saved: {saved}"
+            f"📥 Import background me start ho gaya.\n"
+            f"My Bots → bot → 📊 Live Status se progress dekho."
         )
     except Exception as e:
         log.exception("New bot startup failed")
@@ -433,86 +433,64 @@ async def cancel_add(update, context):
     return ConversationHandler.END
 
 
-async def import_users(cfg):
-    source = MongoClient(
-        cfg["source_mongo_uri"],
-        serverSelectionTimeoutMS=15000,
-    )
+def _import_users_blocking(cfg):
+    source = MongoClient(cfg["source_mongo_uri"], serverSelectionTimeoutMS=15000)
     try:
-        await asyncio.to_thread(source.admin.command, "ping")
+        source.admin.command("ping")
         col = source[cfg["source_db"]][cfg["source_collection"]]
-
         scanned = found = invalid = 0
         ops = []
-
-        for doc in col.find({}):
-            scanned += 1
-            chat_id = None
-
-            for field in cfg.get("uid_fields", []):
-                candidate = normalize_chat_id(dotted_get(doc, field))
-                if candidate is not None:
-                    chat_id = candidate
-                    break
-
-            if chat_id is None:
-                invalid += 1
-                continue
-
-            # Telegram groups/channels/supergroups use negative chat IDs.
-            # This migration service is intentionally private-user-only.
-            if chat_id <= 0:
-                invalid += 1
-                continue
-
-            found += 1
-            ops.append(
-                UpdateOne(
+        cursor = col.find({}, no_cursor_timeout=True).batch_size(IMPORT_BATCH_SIZE)
+        try:
+            for doc in cursor:
+                scanned += 1
+                chat_id = None
+                for field in cfg.get("uid_fields", []):
+                    candidate = normalize_chat_id(dotted_get(doc, field))
+                    if candidate is not None:
+                        chat_id = candidate
+                        break
+                if chat_id is None or chat_id <= 0:
+                    invalid += 1
+                    continue
+                found += 1
+                ops.append(UpdateOne(
                     {"bot_id": cfg["bot_id"], "chat_id": chat_id},
-                    {
-                        "$set": {
-                            "bot_id": cfg["bot_id"],
-                            "old_bot_username": cfg["old_bot_username"],
-                            "new_bot_username": cfg["new_bot"],
-                            "chat_id": chat_id,
-                            "chat_type": "private",
-                            "active": True,
-                            "source_db": cfg["source_db"],
-                            "source_collection": cfg["source_collection"],
-                            "updated_at": datetime.utcnow(),
-                        },
-                        "$setOnInsert": {
-                            "created_at": datetime.utcnow(),
-                            "imported_from_old_db": True,
-                        },
-                    },
-                    upsert=True,
-                )
-            )
-
-            if len(ops) >= 1000:
-                db.users.bulk_write(ops, ordered=False)
-                ops = []
-
-        if ops:
-            db.users.bulk_write(ops, ordered=False)
-
+                    {"$set": {
+                        "bot_id": cfg["bot_id"],
+                        "old_bot_username": cfg["old_bot_username"],
+                        "new_bot_username": cfg["new_bot"],
+                        "chat_id": chat_id,
+                        "chat_type": "private",
+                        "active": True,
+                        "source_db": cfg["source_db"],
+                        "source_collection": cfg["source_collection"],
+                        "updated_at": datetime.utcnow(),
+                    }, "$setOnInsert": {
+                        "created_at": datetime.utcnow(),
+                        "imported_from_old_db": True,
+                    }}, upsert=True))
+                if len(ops) >= IMPORT_BATCH_SIZE:
+                    db.users.bulk_write(ops, ordered=False); ops = []
+                if scanned % 5000 == 0:
+                    log.info("IMPORT progress bot=%s scanned=%s found=%s invalid=%s", cfg["bot_id"], scanned, found, invalid)
+        finally:
+            cursor.close()
+        if ops: db.users.bulk_write(ops, ordered=False)
         unique_saved = db.users.count_documents({"bot_id": cfg["bot_id"]})
-
-        db.bot_configs.update_one(
-            {"bot_id": cfg["bot_id"]},
-            {"$set": {
-                "last_import_at": datetime.utcnow(),
-                "last_import_scanned": scanned,
-                "last_import_found": found,
-                "last_import_invalid": invalid,
-                "last_import_unique_saved": unique_saved,
-            }},
-        )
-
+        db.bot_configs.update_one({"bot_id": cfg["bot_id"]}, {"$set": {
+            "last_import_at": datetime.utcnow(),
+            "last_import_scanned": scanned,
+            "last_import_found": found,
+            "last_import_invalid": invalid,
+            "last_import_unique_saved": unique_saved,
+        }})
         return scanned, found, invalid, unique_saved
     finally:
         source.close()
+
+async def import_users(cfg):
+    return await asyncio.to_thread(_import_users_blocking, cfg)
 
 
 async def old_bot_handler(update, context):
@@ -570,282 +548,209 @@ async def start_managed(cfg):
     bot_id = int(cfg["bot_id"])
     if bot_id in running:
         return
-
     app = Application.builder().token(cfg["token"]).build()
     await app.initialize()
     await app.bot.delete_webhook(drop_pending_updates=False)
     info = await app.bot.get_me()
-
+    cfg = dict(cfg)
     cfg["bot_id"] = info.id
     cfg["old_bot_username"] = info.username
     configs[info.id] = cfg
-
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.ALL, old_bot_handler))
-
-    await import_users(cfg)
-
     await app.start()
-    await app.updater.start_polling(
-        allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=False,
-    )
-
+    await app.updater.start_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=False)
     running[info.id] = app
-
-    db.bot_configs.update_one(
-        {"bot_id": info.id},
-        {"$set": {
-            "enabled": True,
-            "old_bot_username": info.username,
-            "updated_at": datetime.utcnow(),
-        }},
-        upsert=True,
-    )
-
+    await asyncio.to_thread(lambda: db.bot_configs.update_one(
+        {"bot_id": info.id}, {"$set": {"enabled": True, "old_bot_username": info.username, "updated_at": datetime.utcnow()}}, upsert=True))
+    log.info("MANAGED BOT started bot_id=%s @%s", info.id, info.username)
+    start_import_job(info.id)
 
 async def stop_managed(bot_id):
-    app = running.pop(bot_id, None)
-    configs.pop(bot_id, None)
-    if not app:
-        return
-
-    if app.updater and app.updater.running:
-        await app.updater.stop()
-    if app.running:
-        await app.stop()
+    for kind in ("broadcast", "import"):
+        task = jobs.get(f"{kind}:{bot_id}")
+        if task and not task.done(): task.cancel()
+    app = running.pop(bot_id, None); configs.pop(bot_id, None)
+    if not app: return
+    if app.updater and app.updater.running: await app.updater.stop()
+    if app.running: await app.stop()
     await app.shutdown()
-
+    log.info("MANAGED BOT stopped bot_id=%s", bot_id)
 
 async def send_one(app, chat_id, text, markup):
-    while True:
+    for attempt in range(1, 4):
         try:
-            await app.bot.send_message(
-                chat_id=chat_id,
-                text=text,
-                reply_markup=markup,
-            )
+            await app.bot.send_message(chat_id=chat_id, text=text, reply_markup=markup)
             return "sent"
         except RetryAfter as e:
-            await asyncio.sleep(float(e.retry_after) + 1)
+            if attempt >= 3: return "failed"
+            await asyncio.sleep(min(float(e.retry_after) + 1, 30))
         except Forbidden:
             return "blocked"
         except BadRequest:
             return "failed"
         except NetworkError:
-            await asyncio.sleep(2)
-        except Exception:
+            if attempt >= 3: return "failed"
+            await asyncio.sleep(attempt * 2)
+        except Exception as e:
+            log.warning("SEND failed chat=%s attempt=%s err=%s", chat_id, attempt, e)
             return "failed"
+    return "failed"
 
+def _load_broadcast_ids(bot_id):
+    return [int(r["chat_id"]) for r in db.users.find({
+        "bot_id": bot_id, "active": True, "chat_id": {"$gt": 0},
+        "$or": [{"chat_type": "private"}, {"chat_type": {"$exists": False}}]
+    }, {"chat_id": 1}) if r.get("chat_id") is not None and int(r["chat_id"]) > 0]
+
+def _save_broadcast_results(bot_id, results):
+    if not results: return
+    now = datetime.utcnow(); ops=[]
+    for chat_id, status in results:
+        fields={"last_broadcast_at": now, "last_broadcast_status": status}
+        if status == "blocked": fields["active"] = False
+        ops.append(UpdateOne({"bot_id": bot_id, "chat_id": chat_id}, {"$set": fields}))
+    if ops: db.users.bulk_write(ops, ordered=False)
 
 async def broadcast_bot(bot_id):
-    app = running.get(bot_id)
-    cfg = configs.get(bot_id)
-    if not app or not cfg:
-        return 0, 0, 0
+    app=running.get(bot_id); cfg=configs.get(bot_id)
+    if not app or not cfg: raise RuntimeError("Managed bot is not running")
+    ids=await asyncio.to_thread(_load_broadcast_ids, bot_id); total=len(ids); key=f"broadcast:{bot_id}"
+    st=job_status.setdefault(key,{})
+    st.update({"state":"running","done":0,"total":total,"sent":0,"blocked":0,"failed":0,"started_at":datetime.utcnow()})
+    log.info("BROADCAST start bot_id=%s @%s total=%s concurrency=%s", bot_id, cfg.get("old_bot_username"), total, BROADCAST_CONCURRENCY)
+    if not total: return (0,0,0)
+    markup=migrate_markup(cfg["new_bot"]); sem=asyncio.Semaphore(BROADCAST_CONCURRENCY)
+    async def one(cid):
+        async with sem: return cid, await send_one(app,cid,BROADCAST_TEXT,markup)
+    sent=blocked=failed=done=0; chunk_size=max(20,BROADCAST_CONCURRENCY*5)
+    for off in range(0,total,chunk_size):
+        results=await asyncio.gather(*(one(cid) for cid in ids[off:off+chunk_size]))
+        await asyncio.to_thread(_save_broadcast_results, bot_id, results)
+        for _,res in results:
+            done+=1
+            if res=="sent": sent+=1
+            elif res=="blocked": blocked+=1
+            else: failed+=1
+        st.update({"done":done,"sent":sent,"blocked":blocked,"failed":failed})
+        log.info("BROADCAST progress bot_id=%s %s/%s sent=%s blocked=%s failed=%s",bot_id,done,total,sent,blocked,failed)
+        await asyncio.sleep(0)
+    log.info("BROADCAST complete bot_id=%s sent=%s blocked=%s failed=%s",bot_id,sent,blocked,failed)
+    return sent,blocked,failed
 
-    sent = blocked = failed = 0
-    markup = migrate_markup(cfg["new_bot"])
+async def import_job(bot_id):
+    cfg=await asyncio.to_thread(db.bot_configs.find_one,{"bot_id":bot_id})
+    if not cfg: raise RuntimeError("Bot config not found")
+    key=f"import:{bot_id}"; job_status[key]={"state":"running","started_at":datetime.utcnow()}
+    log.info("IMPORT start bot_id=%s db=%s collection=%s",bot_id,cfg.get("source_db"),cfg.get("source_collection"))
+    result=await import_users(cfg)
+    scanned,found,invalid,unique=result
+    job_status[key].update({"scanned":scanned,"found":found,"invalid":invalid,"unique_saved":unique})
+    log.info("IMPORT complete bot_id=%s scanned=%s found=%s invalid=%s unique=%s",bot_id,scanned,found,invalid,unique)
+    return result
 
-    for row in db.users.find(
-        {
-            "bot_id": bot_id,
-            "active": True,
-            "chat_id": {"$gt": 0},
-            "$or": [
-                {"chat_type": "private"},
-                {"chat_type": {"$exists": False}},
-            ],
-        },
-        {"chat_id": 1},
-    ):
-        chat_id = row.get("chat_id")
-        if chat_id is None or chat_id <= 0:
-            continue
+async def broadcast_job(bot_id): return await broadcast_bot(bot_id)
 
-        status = await send_one(
-            app,
-            chat_id,
-            BROADCAST_TEXT,
-            markup,
-        )
+def _start_job(key,factory,initial):
+    cur=jobs.get(key)
+    if cur and not cur.done(): return False
+    job_status[key]=dict(initial)
+    async def runner():
+        try:
+            result=await factory(); st=job_status.setdefault(key,{})
+            st.update({"state":"done","result":result,"finished_at":datetime.utcnow()})
+        except asyncio.CancelledError:
+            job_status.setdefault(key,{})["state"]="cancelled"; log.info("JOB cancelled key=%s",key); raise
+        except Exception as e:
+            st=job_status.setdefault(key,{}); st.update({"state":"error","error":str(e),"finished_at":datetime.utcnow()}); log.exception("JOB failed key=%s",key)
+        finally:
+            jobs.pop(key,None)
+    jobs[key]=asyncio.create_task(runner(),name=key); log.info("JOB scheduled key=%s",key); return True
 
-        if status == "sent":
-            sent += 1
-        elif status == "blocked":
-            blocked += 1
-            db.users.update_one(
-                {"bot_id": bot_id, "chat_id": chat_id},
-                {"$set": {"active": False}},
-            )
-        else:
-            failed += 1
+def start_broadcast_job(bot_id):
+    return _start_job(f"broadcast:{bot_id}",lambda:broadcast_job(bot_id),{"state":"starting","done":0,"total":0,"sent":0,"blocked":0,"failed":0})
+def start_import_job(bot_id):
+    return _start_job(f"import:{bot_id}",lambda:import_job(bot_id),{"state":"starting"})
 
-        db.users.update_one(
-            {"bot_id": bot_id, "chat_id": chat_id},
-            {"$set": {
-                "last_broadcast_at": datetime.utcnow(),
-                "last_broadcast_status": status,
-            }},
-        )
+def format_job_status(bot_id):
+    parts=[]; b=job_status.get(f"broadcast:{bot_id}")
+    if b:
+        s=b.get("state","?")
+        if s in ("starting","running"):
+            total=int(b.get("total",0) or 0); done=int(b.get("done",0) or 0); pct=done*100//total if total else 0
+            parts.append(f"📣 Broadcast: {s}\nProgress: {done}/{total} ({pct}%)\n✅ Sent: {b.get('sent',0)} | 🚫 Blocked: {b.get('blocked',0)} | ❌ Failed: {b.get('failed',0)}")
+        elif s=="done":
+            r=b.get("result") or (0,0,0); parts.append(f"✅ Last broadcast complete\nSent: {r[0]} | Blocked: {r[1]} | Failed: {r[2]}")
+        elif s=="error": parts.append(f"❌ Broadcast error: {b.get('error','unknown')}")
+        elif s=="cancelled": parts.append("🛑 Broadcast cancelled")
+    imp=job_status.get(f"import:{bot_id}")
+    if imp:
+        s=imp.get("state","?")
+        if s in ("starting","running"): parts.append(f"📥 Import: {s}")
+        elif s=="done":
+            r=imp.get("result") or (0,0,0,0); parts.append(f"✅ Last import\nScanned: {r[0]} | IDs: {r[1]} | Invalid: {r[2]} | Unique: {r[3]}")
+        elif s=="error": parts.append(f"❌ Import error: {imp.get('error','unknown')}")
+    return "\n\n".join(parts) if parts else "⚪ No job started yet"
 
-        await asyncio.sleep(0.05)
+def bot_menu_markup(bot_id):
+    return InlineKeyboardMarkup([[InlineKeyboardButton("📣 Broadcast",callback_data=f"bc:{bot_id}"),InlineKeyboardButton("📊 Live Status",callback_data=f"status:{bot_id}")],[InlineKeyboardButton("📥 Re-import",callback_data=f"imp:{bot_id}"),InlineKeyboardButton("🔄 Refresh",callback_data=f"bot:{bot_id}")],[InlineKeyboardButton("🛑 Stop",callback_data=f"stop:{bot_id}"),InlineKeyboardButton("🗑 Remove",callback_data=f"rm:{bot_id}")],[InlineKeyboardButton("⬅️ Back",callback_data="list")]])
 
-    return sent, blocked, failed
+async def render_bot_page(q,bot_id):
+    cfg=await asyncio.to_thread(db.bot_configs.find_one,{"bot_id":bot_id})
+    if not cfg: return await q.edit_message_text("Bot config nahi mili.",reply_markup=panel())
+    users,active=await asyncio.gather(asyncio.to_thread(db.users.count_documents,{"bot_id":bot_id}),asyncio.to_thread(db.users.count_documents,{"bot_id":bot_id,"active":True,"chat_id":{"$gt":0}}))
+    text=(f"{'🟢 Running' if bot_id in running else '🔴 Stopped'}\n\nOld: @{cfg.get('old_bot_username','-')}\nNew: @{cfg.get('new_bot','-')}\nDB: {cfg.get('source_db','-')}\nCollection: {cfg.get('source_collection','-')}\nUID: {', '.join(cfg.get('uid_fields',[]))}\n\n👥 Users: {users}\n✅ Active: {active}\n📥 Last import IDs: {cfg.get('last_import_found','-')}\n\n{format_job_status(bot_id)}")
+    await q.edit_message_text(text,reply_markup=bot_menu_markup(bot_id))
 
 
 async def menu_callback(update, context):
-    q = update.callback_query
-    await q.answer()
-
+    q=update.callback_query
     if not is_admin(update):
+        try: await q.answer("Not authorized",show_alert=True)
+        except Exception: pass
         return
-
-    data = q.data
-
-    if data == "panel":
-        await q.edit_message_text(
-            "🛠 Telegram Migration Master",
-            reply_markup=panel(),
-        )
-        return
-
-    if data == "list":
-        bots = list(db.bot_configs.find({}).sort("created_at", 1))
-
-        if not bots:
-            await q.edit_message_text(
-                "Abhi koi bot add nahi hai.",
-                reply_markup=panel(),
-            )
-            return
-
-        rows = []
-        for item in bots:
-            icon = "🟢" if item["bot_id"] in running else "🔴"
-            rows.append([
-                InlineKeyboardButton(
-                    f"{icon} @{item.get('old_bot_username', item['bot_id'])}",
-                    callback_data=f"bot:{item['bot_id']}",
-                )
-            ])
-        rows.append([InlineKeyboardButton("⬅️ Back", callback_data="panel")])
-
-        await q.edit_message_text(
-            "📋 Managed Bots",
-            reply_markup=InlineKeyboardMarkup(rows),
-        )
-        return
-
-    if data == "reload":
-        started = 0
-        for cfg in db.bot_configs.find({"enabled": True}):
-            try:
-                before = len(running)
-                await start_managed(cfg)
-                if len(running) > before:
-                    started += 1
-            except Exception:
-                log.exception("Reload failed")
-
-        await q.edit_message_text(
-            f"✅ Reload complete\nNewly started: {started}",
-            reply_markup=panel(),
-        )
-        return
-
-    if data == "broadcast_all":
-        sent = blocked = failed = 0
+    data=q.data or ""
+    try: await q.answer("OK",cache_time=0)
+    except Exception: pass
+    log.info("MASTER callback user=%s data=%s",update.effective_user.id,data)
+    if data=="panel":
+        await q.edit_message_text("🛠 Telegram Migration Master",reply_markup=panel()); return
+    if data=="list":
+        bots=await asyncio.to_thread(lambda:list(db.bot_configs.find({}).sort("created_at",1)))
+        if not bots: await q.edit_message_text("Abhi koi bot add nahi hai.",reply_markup=panel()); return
+        rows=[[InlineKeyboardButton(("🟢" if i["bot_id"] in running else "🔴")+f" @{i.get('old_bot_username',i['bot_id'])}",callback_data=f"bot:{i['bot_id']}")] for i in bots]
+        rows.append([InlineKeyboardButton("⬅️ Back",callback_data="panel")]); await q.edit_message_text("📋 Managed Bots",reply_markup=InlineKeyboardMarkup(rows)); return
+    if data=="reload":
+        async def reload_all():
+            cfgs=await asyncio.to_thread(lambda:list(db.bot_configs.find({"enabled":True})))
+            for cfg in cfgs:
+                try: await start_managed(cfg)
+                except Exception: log.exception("Reload failed bot_id=%s",cfg.get("bot_id"))
+        ok=_start_job("reload:all",reload_all,{"state":"starting"})
+        await q.edit_message_text("🔄 Reload background me start ho gaya." if ok else "⚠️ Reload already running.",reply_markup=panel()); return
+    if data=="broadcast_all":
+        started=already=0
         for bot_id in list(running):
-            a, b, c = await broadcast_bot(bot_id)
-            sent += a
-            blocked += b
-            failed += c
-
-        await q.edit_message_text(
-            f"✅ Broadcast All complete\n\n"
-            f"Sent: {sent}\nBlocked: {blocked}\nFailed: {failed}",
-            reply_markup=panel(),
-        )
-        return
-
-    if data.startswith("bot:"):
-        bot_id = int(data.split(":", 1)[1])
-        cfg = db.bot_configs.find_one({"bot_id": bot_id})
-        if not cfg:
-            await q.edit_message_text("Bot config nahi mili.", reply_markup=panel())
-            return
-
-        users = db.users.count_documents({"bot_id": bot_id})
-        active = db.users.count_documents({"bot_id": bot_id, "active": True})
-
-        keyboard = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("📣 Broadcast", callback_data=f"bc:{bot_id}"),
-                InlineKeyboardButton("📥 Re-import", callback_data=f"imp:{bot_id}"),
-            ],
-            [
-                InlineKeyboardButton("🛑 Stop", callback_data=f"stop:{bot_id}"),
-                InlineKeyboardButton("🗑 Remove", callback_data=f"rm:{bot_id}"),
-            ],
-            [InlineKeyboardButton("⬅️ Back", callback_data="list")],
-        ])
-
-        await q.edit_message_text(
-            f"{'🟢 Running' if bot_id in running else '🔴 Stopped'}\n\n"
-            f"Old: @{cfg.get('old_bot_username', '-')}\n"
-            f"New: @{cfg.get('new_bot', '-')}\n"
-            f"DB: {cfg.get('source_db', '-')}\n"
-            f"Collection: {cfg.get('source_collection', '-')}\n"
-            f"UID: {', '.join(cfg.get('uid_fields', []))}\n\n"
-            f"Users: {users}\n"
-            f"Active: {active}\n"
-            f"Last import IDs: {cfg.get('last_import_found', '-')}",
-            reply_markup=keyboard,
-        )
-        return
-
-    action, bot_id_raw = data.split(":", 1)
-    bot_id = int(bot_id_raw)
-    cfg = db.bot_configs.find_one({"bot_id": bot_id})
-
-    if action == "bc":
-        result = await broadcast_bot(bot_id)
-        await q.edit_message_text(
-            f"✅ Broadcast complete\n\n"
-            f"Sent: {result[0]}\nBlocked: {result[1]}\nFailed: {result[2]}",
-            reply_markup=panel(),
-        )
-
-    elif action == "imp":
-        if not cfg:
-            await q.edit_message_text("Bot config nahi mili.", reply_markup=panel())
-            return
-
-        scanned, found, invalid, unique_saved = await import_users(cfg)
-        await q.edit_message_text(
-            f"✅ Import complete\n\n"
-            f"Scanned: {scanned}\n"
-            f"Valid IDs found: {found}\n"
-            f"Invalid/no ID: {invalid}\n"
-            f"Unique users saved: {unique_saved}",
-            reply_markup=panel(),
-        )
-
-    elif action == "stop":
-        await stop_managed(bot_id)
-        db.bot_configs.update_one(
-            {"bot_id": bot_id},
-            {"$set": {"enabled": False}},
-        )
-        await q.edit_message_text("🛑 Bot stopped.", reply_markup=panel())
-
-    elif action == "rm":
-        await stop_managed(bot_id)
-        db.bot_configs.delete_one({"bot_id": bot_id})
-        await q.edit_message_text(
-            "🗑 Bot config removed.\nImported users retained in destination DB.",
-            reply_markup=panel(),
-        )
+            if start_broadcast_job(bot_id): started+=1
+            else: already+=1
+        await q.edit_message_text(f"📣 Broadcast jobs scheduled.\n\nStarted: {started}\nAlready running: {already}\n\nMy Bots → bot → 📊 Live Status",reply_markup=panel()); return
+    if data.startswith("bot:") or data.startswith("status:"):
+        await render_bot_page(q,int(data.split(":",1)[1])); return
+    if ":" not in data:
+        await q.edit_message_text("Unknown action.",reply_markup=panel()); return
+    action,raw=data.split(":",1); bot_id=int(raw)
+    if action=="bc":
+        if bot_id not in running:
+            await q.edit_message_text("❌ Ye bot running nahi hai. Reload karo.",reply_markup=panel()); return
+        ok=start_broadcast_job(bot_id)
+        await q.edit_message_text("📣 Broadcast STARTED in background." if ok else "⚠️ Broadcast already running.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📊 Live Status",callback_data=f"status:{bot_id}")],[InlineKeyboardButton("⬅️ Main Panel",callback_data="panel")]])); return
+    if action=="imp":
+        ok=start_import_job(bot_id)
+        await q.edit_message_text("📥 Re-import STARTED in background." if ok else "⚠️ Import already running.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📊 Live Status",callback_data=f"status:{bot_id}")],[InlineKeyboardButton("⬅️ Main Panel",callback_data="panel")]])); return
+    if action=="stop":
+        await stop_managed(bot_id); await asyncio.to_thread(db.bot_configs.update_one,{"bot_id":bot_id},{"$set":{"enabled":False}}); await q.edit_message_text("🛑 Bot stopped.",reply_markup=panel()); return
+    if action=="rm":
+        await stop_managed(bot_id); await asyncio.to_thread(db.bot_configs.delete_one,{"bot_id":bot_id}); await q.edit_message_text("🗑 Bot config removed.\nImported users retained.",reply_markup=panel()); return
+    await q.edit_message_text("Unknown action.",reply_markup=panel())
 
 
 def seconds_until_daily():
@@ -866,11 +771,8 @@ def seconds_until_daily():
 async def daily_loop():
     while True:
         await asyncio.sleep(seconds_until_daily())
-        for bot_id in list(running):
-            try:
-                await broadcast_bot(bot_id)
-            except Exception:
-                log.exception("Daily broadcast failed bot_id=%s", bot_id)
+        started=sum(1 for bid in list(running) if start_broadcast_job(bid))
+        log.info("DAILY broadcast scheduled bots=%s",started)
 
 
 async def start_web():
@@ -887,6 +789,17 @@ async def start_web():
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", PORT).start()
+
+
+async def status_cmd(update, context):
+    if not is_admin(update): return
+    lines=["📊 Background Jobs"]
+    if not job_status: lines.append("No jobs yet.")
+    for key,st in sorted(job_status.items()):
+        if key.startswith("broadcast:"):
+            lines.append(f"{key}: {st.get('state','?')} {st.get('done',0)}/{st.get('total',0)} sent={st.get('sent',0)} blocked={st.get('blocked',0)} failed={st.get('failed',0)}")
+        else: lines.append(f"{key}: {st.get('state','?')}")
+    await update.message.reply_text("\n".join(lines)[:4000])
 
 
 async def main():
@@ -965,11 +878,12 @@ async def main():
     )
 
     master.add_handler(CommandHandler("start", start_cmd))
+    master.add_handler(CommandHandler("status", status_cmd))
     master.add_handler(add_conv)
     master.add_handler(
         CallbackQueryHandler(
             menu_callback,
-            pattern=r"^(panel|list|reload|broadcast_all|bot:\d+|bc:\d+|imp:\d+|stop:\d+|rm:\d+)$",
+            pattern=r"^(panel|list|reload|broadcast_all|bot:\d+|status:\d+|bc:\d+|imp:\d+|stop:\d+|rm:\d+)$",
         )
     )
 
@@ -981,11 +895,12 @@ async def main():
         drop_pending_updates=False,
     )
 
-    for cfg in db.bot_configs.find({"enabled": True}):
+    saved_cfgs = await asyncio.to_thread(lambda: list(db.bot_configs.find({"enabled": True})))
+    for cfg in saved_cfgs:
         try:
             await start_managed(cfg)
         except Exception:
-            log.exception("Saved bot start failed")
+            log.exception("Saved bot start failed bot_id=%s", cfg.get("bot_id"))
 
     daily_task = asyncio.create_task(daily_loop())
 
