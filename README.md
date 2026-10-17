@@ -83,3 +83,14 @@ Start with:
 `BROADCAST_CONCURRENCY=12`
 
 On a small Render instance, 8-15 is a sensible range. Higher is not always faster because Telegram rate limits can trigger RetryAfter.
+
+
+## v6 live status / responsiveness fix
+
+- Broadcast button returns immediately.
+- `📊 Live Status` shows current sent/blocked/failed counters and progress.
+- `🔄 Refresh` refreshes the same bot page.
+- Re-import status is shown on the same page.
+- Background-job launcher is lazy, avoiding orphan coroutine objects on duplicate clicks.
+- Mongo counts used by UI run in worker threads.
+- Default broadcast concurrency reduced to 8 for smoother Telegram rate-limit behaviour.
