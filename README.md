@@ -59,3 +59,27 @@ This version is private-chat-only:
 - Does not import negative Telegram chat IDs
 - Broadcast only targets positive private-user chat IDs
 - Existing negative IDs from older versions are automatically marked inactive on startup
+
+
+## v5 multitasking/performance
+
+Long operations no longer run inside Telegram callback handlers.
+
+- Broadcast runs as a background task.
+- Re-import runs as a background task.
+- Multiple different bots can broadcast/import concurrently.
+- A single bot cannot accidentally start duplicate broadcasts/imports.
+- Synchronous PyMongo import is moved to a worker thread (`asyncio.to_thread`).
+- Broadcast uses controlled parallel sends (`BROADCAST_CONCURRENCY`, default 12).
+- Huge user lists are processed in chunks instead of creating one asyncio task per user.
+- Master and managed Telegram applications enable concurrent update processing.
+- Starting/reloading an old bot no longer waits for its Mongo import to finish.
+- Stopping a bot cancels its active import/broadcast jobs.
+
+### Tuning
+
+Start with:
+
+`BROADCAST_CONCURRENCY=12`
+
+On a small Render instance, 8-15 is a sensible range. Higher is not always faster because Telegram rate limits can trigger RetryAfter.
