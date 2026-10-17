@@ -1,33 +1,61 @@
-# Telegram Migration Master Panel
+# Telegram Migration Master Panel v3
 
-Render ENV me sirf:
-- MASTER_BOT_TOKEN
-- ADMIN_USER_ID
-- DEST_MONGO_URI
-- DEST_DB (optional)
-- TIMEZONE / BROADCAST_TIME (optional)
+## New easier Add Bot flow
 
-Deploy ke baad master bot me `/start` bhejo.
+1. `/start`
+2. `➕ Add Bot`
+3. Send OLD bot token
+4. Send NEW bot username
+5. Send old/source MongoDB URL
+6. Send database name, e.g. `mybotdb`
+7. Bot automatically lists all collections as inline buttons
+8. Tap the collection (e.g. `users`)
+9. Bot inspects sample documents and lists possible fields as inline buttons
+10. Tap UID field (e.g. `userId`)
+11. Import starts automatically and shows:
+   - documents scanned
+   - valid IDs found
+   - unique users saved
 
-Buttons:
-- Add Bot
-- My Bots
-- Broadcast All
-- Reload
+No need to type collection or UID field manually.
 
-Add Bot wizard asks for:
-1. Old bot token
-2. New bot username
-3. Old/source MongoDB URL
-4. Source database
-5. Source collection
-6. UID fields
+## Render ENV
 
-Each bot configuration is stored in the destination MongoDB, so Render restarts do not erase it.
+Required:
+
+MASTER_BOT_TOKEN
+ADMIN_USER_ID
+DEST_MONGO_URI
+
+Optional:
+
+DEST_DB=telegram_migration
+TIMEZONE=Asia/Kolkata
+BROADCAST_TIME=10:00
+
+## Existing features
+
+- Multiple old bots from one master bot
+- Bot configs persist in destination MongoDB
+- Old DB users imported per bot
+- New messages to old bot auto-save user + show migration button
+- Daily broadcast
+- Manual broadcast per bot
+- Broadcast all
+- Re-import
+- Stop/remove bot
 
 Important:
-- Master panel works only for ADMIN_USER_ID.
-- Telegram Bot API cannot fetch every historical user. The old DB must contain chat/user IDs.
-- Daily migration broadcast is sent from the OLD bot.
-- A NEW bot cannot proactively DM a user until that user starts the new bot.
-- Keep tokens and Mongo credentials only in Render Environment Variables / the private admin panel.
+Telegram Bot API cannot list historical users. Historical user IDs must exist in the old database.
+
+
+## v4 anti-spam safety
+
+This version is private-chat-only:
+
+- Does not auto-reply in groups
+- Does not auto-reply in supergroups
+- Does not auto-reply in channels
+- Does not import negative Telegram chat IDs
+- Broadcast only targets positive private-user chat IDs
+- Existing negative IDs from older versions are automatically marked inactive on startup
