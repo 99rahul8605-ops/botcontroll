@@ -440,7 +440,7 @@ def _import_users_blocking(cfg):
         col = source[cfg["source_db"]][cfg["source_collection"]]
         scanned = found = invalid = 0
         ops = []
-        cursor = col.find({}, no_cursor_timeout=True).batch_size(IMPORT_BATCH_SIZE)
+        cursor = col.find({}).batch_size(IMPORT_BATCH_SIZE)
         try:
             for doc in cursor:
                 scanned += 1
